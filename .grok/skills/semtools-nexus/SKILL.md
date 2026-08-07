@@ -29,10 +29,13 @@ Project-scoped Flow Nexus skill for **SemTools** plus **Grok CLI**:
 
 1. CLIs:
    ```bash
-   command -v grok || command -v /home/dok/.grok/bin/grok
+   # Install Grok-backed ask/parse from this repo (once per machine)
+   ./scripts/grok-cli/install.sh
+   command -v grok
    command -v search || command -v semtools   # local search/workspace
    .grok/skills/semtools-nexus/scripts/semtools-doctor.sh
    ```
+   Packaged sources: `scripts/grok-cli/{ask,parse,install.sh,README.md}`
 2. Grok authenticated (same session/account as normal Grok Build) — no separate
    Llama Cloud or OpenAI keys for Nexus pipelines.
 3. Optional: `SEMTOOLS_WORKSPACE` after `semtools workspace use <name>` (or `workspace use`).
@@ -113,7 +116,7 @@ semtools workspace prune
 
 | Goal | Pipeline |
 |------|----------|
-| Fresh PDF Q&A | `grok-parse.sh` → `grok-ask.sh` |
+| Fresh PDF Q&A | `parse` → `ask` (or skill helpers) |
 | Keyword exploration | parse if needed → `search` |
 | Large stable corpus | `workspace use` → repeated `search`; Grok only for deep ask |
 | Exact + semantic | `grep` prefilter → `search` |
@@ -142,9 +145,9 @@ When this skill is active:
 
 1. **Clarify corpus** — paths, workspace, whether parse is needed
 2. **Doctor** if unsure — `scripts/semtools-doctor.sh` (expects `grok` + local search, not cloud keys)
-3. **Parse with Grok** — `grok-parse.sh` or `grok -p … --tools read_file --yolo`; never LlamaParse / `LLAMA_CLOUD_API_KEY`
+3. **Parse with Grok** — installed `parse` or `scripts/grok-cli/parse`; never LlamaParse / `LLAMA_CLOUD_API_KEY`
 4. **Search with semtools** — local only; do not reimplement embeddings in prose
-5. **Ask with Grok** — `grok-ask.sh` or `grok -p …`; never `OPENAI_API_KEY` / `semtools ask` for Nexus
+5. **Ask with Grok** — installed `ask` or `scripts/grok-cli/ask`; never `OPENAI_API_KEY` / cargo OpenAI ask
 6. **Cap blast radius** — explicit paths; `--max-turns` on long Grok jobs if needed
 7. **Synthesize** with path citations
 8. **MCP only after intent** — confirm before mutating remote systems
@@ -159,5 +162,6 @@ When this skill is active:
 
 - `references/mcp-integration.md`
 - `references/cli-cheatsheet.md`
+- Packaged wrappers: `scripts/grok-cli/README.md`
 - Grok headless: `~/.grok/docs/user-guide/14-headless-mode.md`
 - Local search: repo `README.md` (`search` / `workspace` sections only)

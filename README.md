@@ -28,6 +28,18 @@ Prerequisites:
 - For the `parse` subcommand: LlamaIndex Cloud API key
 - For the `ask` subcommand: OpenAI API key
 
+### Optional: Grok CLI drop-ins (no Llama Cloud / OpenAI)
+
+This fork packages Grok-backed replacements for `parse` and `ask` under `scripts/grok-cli/`:
+
+```bash
+./scripts/grok-cli/install.sh   # → ~/.grok/bin and ~/.local/bin
+ask --version                   # ask 1.0.0-grok …
+parse --version                 # parse 1.0.0-grok …
+```
+
+Put `~/.local/bin` (or `~/.grok/bin`) **before** `~/.cargo/bin` on `PATH`. See [`scripts/grok-cli/README.md`](scripts/grok-cli/README.md). Local `search` / `workspace` still use the normal semtools binaries.
+
 Install:
 
 You can install `semtools` via npm:

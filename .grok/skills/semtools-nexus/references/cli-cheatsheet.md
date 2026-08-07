@@ -68,5 +68,11 @@ hits=$(search "auth" ./docs/*.md --top-k 10)
 
 ## Install / paths
 
-- Grok: `/home/dok/.grok/bin/grok` (or `grok` on PATH)
-- Local search: `cargo install semtools` or npm `@llamaindex/semtools` — only need **search** + **workspace** features for Nexus
+```bash
+# From repo root — install Grok ask/parse wrappers
+./scripts/grok-cli/install.sh
+```
+
+- Packaged sources: `scripts/grok-cli/{ask,parse}`
+- Grok binary: `$HOME/.grok/bin/grok` or `grok` on PATH
+- Local search: `cargo install semtools` or npm `@llamaindex/semtools` — only need **search** + **workspace** for Nexus

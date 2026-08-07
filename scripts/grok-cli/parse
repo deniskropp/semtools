@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# parse — Grok CLI drop-in replacement for semtools `parse` (LlamaParse-free)
+#
+# Usage (compatible with @llamaindex/semtools parse):
+#   parse [OPTIONS] <FILES>...
+#   parse docs/*.pdf
+#   parse report.pdf | xargs ask "Summarize"
+#
+# Stdout: one result path per line (cached markdown under ~/.parse, or original
+# path for already-readable text). Matches semtools pipeline contract.
+#
+# Options:
+#   -c, --config <CONFIG>      Accepted for compatibility; ignored
+#   -b, --backend <BACKEND>    grok (default) | llama-parse (remapped → grok)
+#   -m, --model <MODEL>        Grok model id (also: GROK_MODEL)
+#   -v, --verbose              Verbose progress on stderr
+#       --force                Ignore cache and re-parse
+#       --max-turns <N>        Agent turns (default: PARSE_MAX_TURNS or 24)
+#       --cache-dir <DIR>      Cache directory (default: ~/.parse)
+#   -h, --help                 Help
+#   -V, --version              Version
+#
+# Env:
+#   GROK_BIN, GROK_MODEL, PARSE_MAX_TURNS, PARSE_CACHE_DIR
+#   PARSE_TOOLS (default: read_file), PARSE_NO_YOLO=1
+
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  _dir="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$_dir/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+if [[ -n "${GROK_BIN:-}" ]]; then
+  :
+elif [[ -x "${SCRIPT_DIR}/grok" ]]; then
+  GROK_BIN="${SCRIPT_DIR}/grok"
+elif [[ -x "${HOME}/.grok/bin/grok" ]]; then
+  GROK_BIN="${HOME}/.grok/bin/grok"
+elif command -v grok >/dev/null 2>&1; then
+  GROK_BIN="$(command -v grok)"
+else
+  echo "parse: grok CLI not found (expected ${SCRIPT_DIR}/grok)" >&2
+  exit 127
+fi
+
+VERSION="parse 1.0.0-grok (semtools-compatible wrapper)"
+CACHE_DIR="${PARSE_CACHE_DIR:-${HOME}/.parse}"
+MAX_TURNS="${PARSE_MAX_TURNS:-24}"
+MODEL="${GROK_MODEL:-}"
+VERBOSE=0
+FORCE=0
+BACKEND="grok"
+FILES=()
+
+usage() {
+  cat <<'EOF'
+A CLI tool for parsing documents (Grok CLI backend; drop-in for semtools parse)
+
+Usage: parse [OPTIONS] <FILES>...
+
+Arguments:
+  <FILES>...  Files (or directories) to parse
+
+Options:
+  -c, --config <CONFIG>      Ignored (semtools compat)
+  -b, --backend <BACKEND>    grok (default). llama-parse is accepted but maps to grok
+  -m, --model <MODEL>        Model to use (passed to grok -m)
+  -v, --verbose              Verbose output while parsing
+      --force                Re-parse even if cache is valid
+      --max-turns <N>        Max agent turns [default: 24]
+      --cache-dir <DIR>      Cache directory [default: ~/.parse]
+  -h, --help                 Print help
+  -V, --version              Print version
+
+Stdout:
+  One path per line — markdown under the cache dir, or the original path for
+  already-readable text (txt/md/rs/…). Suitable for: parse *.pdf | xargs ask "…"
+
+Environment:
+  GROK_BIN, GROK_MODEL, PARSE_MAX_TURNS, PARSE_CACHE_DIR, PARSE_TOOLS, PARSE_NO_YOLO
+
+Examples:
+  parse report.pdf
+  parse papers/*.pdf | xargs search "evaluation"
+  parse -v --force slide-deck.pptx
+EOF
+}
+
+logv() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "$*" >&2
+  fi
+}
+
+# Extensions semtools leaves as-is (print original path, no cache)
+is_passthrough_text() {
+  local ext
+  ext="$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$ext" in
+    txt|md|rst|org|csv|json|xml|yaml|yml|py|js|ts|rs|toml|html|htm|css|sh|bash) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detect UTF-8 / plain text for a local fast path (copy into cache without Grok)
+is_plain_text_file() {
+  local f="$1"
+  if command -v file >/dev/null 2>&1; then
+    local desc
+    desc="$(file -b --mime-type "$f" 2>/dev/null || true)"
+    case "$desc" in
+      text/*|application/json|application/xml|application/javascript|inode/x-empty)
+        return 0
+        ;;
+    esac
+    # file sometimes says application/octet-stream for .dat; try soft check
+    if file -b "$f" 2>/dev/null | grep -qiE 'text|ASCII|UTF-8|Unicode'; then
+      return 0
+    fi
+  fi
+  # Heuristic: no NUL in first 8KiB and mostly printable
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+try:
+    data = open(p, "rb").read(8192)
+except OSError:
+    sys.exit(1)
+if b"\x00" in data:
+    sys.exit(1)
+# allow high proportion of text bytes
+if not data:
+    sys.exit(0)
+textish = sum(1 for b in data if b in (9, 10, 13) or 32 <= b < 127 or b >= 0xC0)
+sys.exit(0 if textish / len(data) > 0.85 else 1)
+PY
+    return $?
+  fi
+  return 1
+}
+
+file_mtime_secs() {
+  if stat -c %Y "$1" >/dev/null 2>&1; then
+    stat -c %Y "$1"
+  else
+    stat -f %m "$1"
+  fi
+}
+
+file_size() {
+  if stat -c %s "$1" >/dev/null 2>&1; then
+    stat -c %s "$1"
+  else
+    stat -f %z "$1"
+  fi
+}
+
+cache_paths_for() {
+  local base
+  base="$(basename "$1")"
+  META_PATH="${CACHE_DIR}/${base}.metadata.json"
+  PARSED_PATH="${CACHE_DIR}/${base}.md"
+}
+
+cache_valid() {
+  local src="$1"
+  cache_paths_for "$src"
+  [[ -f "$META_PATH" && -f "$PARSED_PATH" ]] || return 1
+  local mtime size cached_mtime cached_size cached_path
+  mtime="$(file_mtime_secs "$src")"
+  size="$(file_size "$src")"
+  command -v python3 >/dev/null 2>&1 || return 1
+  read -r cached_mtime cached_size cached_path < <(
+    python3 - "$META_PATH" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(m.get("modified_time", ""), m.get("size", ""), m.get("parsed_path", ""))
+PY
+  )
+  [[ "$cached_mtime" == "$mtime" && "$cached_size" == "$size" && -f "$cached_path" ]]
+}
+
+write_cache() {
+  local src="$1" content="$2"
+  cache_paths_for "$src"
+  mkdir -p "$CACHE_DIR"
+  # Ensure trailing newline for nicer text tools
+  if [[ -n "$content" && "${content: -1}" != $'\n' ]]; then
+    content+=$'\n'
+  fi
+  printf '%s' "$content" >"$PARSED_PATH"
+  local mtime size
+  mtime="$(file_mtime_secs "$src")"
+  size="$(file_size "$src")"
+  python3 - "$META_PATH" "$mtime" "$size" "$PARSED_PATH" <<'PY'
+import json, sys
+path, mtime, size, parsed = sys.argv[1:5]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(
+        {"modified_time": int(mtime), "size": int(size), "parsed_path": parsed},
+        f,
+        indent=2,
+    )
+    f.write("\n")
+PY
+}
+
+collect_inputs() {
+  local arg f
+  for arg in "$@"; do
+    if [[ -d "$arg" ]]; then
+      while IFS= read -r -d '' f; do
+        FILES+=("$f")
+      done < <(find "$arg" -type f -print0 2>/dev/null | head -z -n 500)
+    elif [[ -e "$arg" ]]; then
+      FILES+=("$arg")
+    else
+      echo "parse: warn: path does not exist: $arg" >&2
+    fi
+  done
+}
+
+extract_with_grok() {
+  local abs="$1"
+  local prompt errf out status
+  prompt="Read the file at path exactly once using the read_file tool, then emit its full content as clean markdown.
+Rules:
+- Extract completely; do not summarize.
+- Preserve headings, lists, tables, and code.
+- Output ONLY the markdown body (no preamble, no tool chatter).
+File: ${abs}"
+
+  local -a cmd
+  cmd=("$GROK_BIN" -p "$prompt" --max-turns "$MAX_TURNS" --output-format plain --verbatim)
+  if [[ -z "${PARSE_NO_YOLO:-}" ]]; then
+    cmd+=(--yolo)
+  fi
+  cmd+=(--tools "${PARSE_TOOLS:-read_file}")
+  if [[ -n "$MODEL" ]]; then
+    cmd+=(-m "$MODEL")
+  fi
+
+  errf="$(mktemp)"
+  set +e
+  out="$("${cmd[@]}" 2>"$errf")"
+  status=$?
+  set -e
+
+  if [[ "$VERBOSE" -eq 1 && -s "$errf" ]]; then
+    # Show grok diagnostics but keep stdout clean for path printing
+    sed 's/^/parse[grok]: /' "$errf" >&2 || true
+  fi
+
+  if [[ $status -ne 0 ]]; then
+    if [[ -s "$errf" ]]; then
+      tail -n 20 "$errf" | sed 's/^/parse: /' >&2 || true
+    fi
+    rm -f "$errf"
+    return "$status"
+  fi
+  rm -f "$errf"
+
+  # Strip common accidental fences if the model wrapped output
+  out="$(OUT_TEXT="$out" python3 - <<'PY'
+import os
+t = os.environ.get("OUT_TEXT", "")
+lines = t.splitlines()
+if lines and lines[0].strip().startswith("```"):
+    lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    t = "\n".join(lines)
+if t and not t.endswith("\n"):
+    t += "\n"
+print(t, end="")
+PY
+)"
+  if [[ -z "${out// }" ]]; then
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# --- args ---
+INPUTS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version)
+      echo "$VERSION"
+      echo "backend: $GROK_BIN"
+      echo "cache:   $CACHE_DIR"
+      exit 0
+      ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -m|--model) MODEL="${2:-}"; shift 2 ;;
+    --max-turns) MAX_TURNS="${2:-24}"; shift 2 ;;
+    --cache-dir) CACHE_DIR="${2:-$CACHE_DIR}"; shift 2 ;;
+    -c|--config)
+      if [[ $# -ge 2 && "$2" != -* ]]; then shift 2; else shift; fi
+      ;;
+    -b|--backend) BACKEND="${2:-grok}"; shift 2 ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do INPUTS+=("$1"); shift; done
+      break
+      ;;
+    -*)
+      echo "parse: unknown option: $1" >&2
+      echo "Try 'parse --help' for more information." >&2
+      exit 2
+      ;;
+    *) INPUTS+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#INPUTS[@]} -eq 0 ]]; then
+  echo "parse: missing FILES" >&2
+  echo "Try 'parse --help' for more information." >&2
+  exit 2
+fi
+
+case "$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')" in
+  grok|grok-cli|"") BACKEND=grok ;;
+  llama-parse|llamaparse|llama)
+    logv "parse: backend '$BACKEND' remapped to grok (LlamaParse not used)"
+    BACKEND=grok
+    ;;
+  *)
+    echo "parse: unknown backend '$BACKEND' (using grok)" >&2
+    BACKEND=grok
+    ;;
+esac
+
+collect_inputs "${INPUTS[@]}"
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "parse: no files to process" >&2
+  exit 1
+fi
+
+mkdir -p "$CACHE_DIR"
+failures=0
+
+for src in "${FILES[@]}"; do
+  if [[ ! -f "$src" ]]; then
+    [[ -d "$src" ]] && continue
+    echo "parse: warn: skip missing file: $src" >&2
+    continue
+  fi
+
+  # Passthrough text types → original path (semtools contract)
+  if is_passthrough_text "$src"; then
+    logv "Skipping readable file: $src"
+    printf '%s\n' "$(realpath "$src")"
+    continue
+  fi
+
+  abs="$(realpath "$src")"
+
+  if [[ "$FORCE" -eq 0 ]] && cache_valid "$abs"; then
+    cache_paths_for "$abs"
+    logv "Using cached result for: $abs"
+    printf '%s\n' "$PARSED_PATH"
+    continue
+  fi
+
+  logv "Processing file: $abs"
+
+  content=""
+  # Fast path: plain text with exotic extension → copy into cache
+  if is_plain_text_file "$abs"; then
+    logv "Plain-text fast path (no Grok): $abs"
+    content="$(cat "$abs")"
+  else
+    if ! content="$(extract_with_grok "$abs")"; then
+      echo "parse: error processing: $abs" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+  fi
+
+  if [[ -z "${content// }" ]]; then
+    echo "parse: empty result for: $abs" >&2
+    failures=$((failures + 1))
+    continue
+  fi
+
+  write_cache "$abs" "$content"
+  cache_paths_for "$abs"
+  logv "Wrote: $PARSED_PATH"
+  printf '%s\n' "$PARSED_PATH"
+done
+
+if [[ "$failures" -gt 0 ]]; then
+  exit 1
+fi
+exit 0

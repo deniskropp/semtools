@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# ask — Grok CLI drop-in replacement for semtools `ask` (OpenAI-free)
+#
+# Usage (compatible with @llamaindex/semtools ask):
+#   ask [OPTIONS] <QUERY> [FILES]...
+#   cat notes.md | ask "Summarize this"
+#   ask "Main findings?" paper1.md paper2.md
+#
+# Options:
+#   -m, --model <MODEL>        Grok model id (also: GROK_MODEL)
+#   -c, --config <CONFIG>      Accepted for compatibility; ignored
+#       --api-key <KEY>        Accepted for compatibility; ignored
+#       --base-url <URL>       Accepted for compatibility; ignored
+#       --api-mode <MODE>      Accepted for compatibility; ignored
+#       --max-turns <N>        Agent turns (default: GROK_MAX_TURNS or 24)
+#       --json                 Best-effort JSON wrapper around plain answer
+#   -h, --help                 Help
+#   -V, --version              Version
+#
+# Env:
+#   GROK_BIN         Absolute path to grok binary (default: sibling of this script)
+#   GROK_MODEL       Default model for -m
+#   GROK_MAX_TURNS   Default max turns (24)
+#   ASK_TOOLS        Tool allowlist (default: read_file,grep,list_dir)
+#   ASK_NO_YOLO=1    Do not pass --yolo (require approvals)
+
+set -euo pipefail
+
+# Resolve real script dir (follow symlink so ~/.local/bin/ask → ~/.grok/bin works)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  _dir="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$_dir/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+# Prefer real grok next to this wrapper (never PATH lookup first → no recursion)
+if [[ -n "${GROK_BIN:-}" ]]; then
+  :
+elif [[ -x "${SCRIPT_DIR}/grok" ]]; then
+  GROK_BIN="${SCRIPT_DIR}/grok"
+elif [[ -x "${HOME}/.grok/bin/grok" ]]; then
+  GROK_BIN="${HOME}/.grok/bin/grok"
+elif command -v grok >/dev/null 2>&1; then
+  GROK_BIN="$(command -v grok)"
+else
+  echo "ask: grok CLI not found (expected ${SCRIPT_DIR}/grok)" >&2
+  exit 127
+fi
+
+VERSION="ask 1.0.0-grok (semtools-compatible wrapper)"
+MAX_TURNS="${GROK_MAX_TURNS:-24}"
+MODEL="${GROK_MODEL:-}"
+JSON=0
+QUERY=""
+FILES=()
+COMPAT_IGNORED=()
+
+usage() {
+  cat <<'EOF'
+A CLI tool for document Q&A (Grok CLI backend; drop-in for semtools ask)
+
+Usage: ask [OPTIONS] <QUERY> [FILES]...
+
+Arguments:
+  <QUERY>     Query to prompt the agent with
+  [FILES]...  Files to read; optional if piping content on stdin
+
+Options:
+  -c, --config <CONFIG>      Ignored (semtools compat)
+      --api-key <API_KEY>    Ignored (semtools compat; no OpenAI)
+      --base-url <BASE_URL>  Ignored (semtools compat)
+  -m, --model <MODEL>        Model to use (passed to grok -m)
+      --api-mode <API_MODE>  Ignored (semtools compat)
+      --max-turns <N>        Max agent turns [default: 24]
+      --json                 Wrap answer in a minimal JSON object
+  -h, --help                 Print help
+  -V, --version              Print version
+
+Environment:
+  GROK_BIN, GROK_MODEL, GROK_MAX_TURNS, ASK_TOOLS, ASK_NO_YOLO
+
+Examples:
+  ask "How do I install?" README.md
+  cat README.md | ask "How do I install?"
+  ask -m grok-build "Summarize methods" papers/*.md
+EOF
+}
+
+# --- parse args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -V|--version)
+      echo "$VERSION"
+      echo "backend: $GROK_BIN"
+      exit 0
+      ;;
+    -m|--model)
+      MODEL="${2:-}"
+      shift 2
+      ;;
+    --max-turns)
+      MAX_TURNS="${2:-24}"
+      shift 2
+      ;;
+    --json)
+      JSON=1
+      shift
+      ;;
+    -c|--config|--api-key|--base-url|--api-mode)
+      COMPAT_IGNORED+=("$1")
+      if [[ $# -ge 2 && "$2" != -* ]]; then
+        COMPAT_IGNORED+=("$2")
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "ask: unknown option: $1" >&2
+      echo "Try 'ask --help' for more information." >&2
+      exit 2
+      ;;
+    *)
+      if [[ -z "$QUERY" ]]; then
+        QUERY="$1"
+      else
+        FILES+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+# leftover after --
+while [[ $# -gt 0 ]]; do
+  if [[ -z "$QUERY" ]]; then
+    QUERY="$1"
+  else
+    FILES+=("$1")
+  fi
+  shift
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "ask: missing QUERY" >&2
+  echo "Try 'ask --help' for more information." >&2
+  exit 2
+fi
+
+if [[ ${#COMPAT_IGNORED[@]} -gt 0 && -n "${ASK_VERBOSE:-}" ]]; then
+  echo "ask: ignoring semtools-compat flags: ${COMPAT_IGNORED[*]}" >&2
+fi
+
+# --- stdin content when no files and not a TTY ---
+STDIN_CONTENT=""
+if [[ ${#FILES[@]} -eq 0 ]] && [[ ! -t 0 ]]; then
+  STDIN_CONTENT="$(cat || true)"
+fi
+
+if [[ ${#FILES[@]} -eq 0 && -z "$STDIN_CONTENT" ]]; then
+  echo "No input provided. Either specify files as arguments or pipe input to stdin." >&2
+  exit 1
+fi
+
+# Expand globs that the user quoted as literal patterns (best-effort)
+expanded=()
+for f in "${FILES[@]+"${FILES[@]}"}"; do
+  if [[ -e "$f" ]]; then
+    expanded+=("$f")
+  else
+    # leave missing paths; grok may still try via tools / we warn
+    expanded+=("$f")
+  fi
+done
+FILES=("${expanded[@]+"${expanded[@]}"}")
+
+# --- build prompt ---
+if [[ -n "$STDIN_CONTENT" ]]; then
+  # Mirror semtools ask_agent_with_stdin: answer from pasted content, no file tools required
+  prompt="You are a document Q&A assistant (semtools-compatible ask via Grok CLI).
+Answer the question using ONLY the provided stdin content. If the answer is not in the content, say so clearly.
+
+Question: ${QUERY}
+
+--- BEGIN STDIN CONTENT ---
+${STDIN_CONTENT}
+--- END STDIN CONTENT ---"
+  TOOLS="${ASK_TOOLS:-}"
+else
+  file_block=$'\nFiles (read these with tools; cite paths in the answer):\n'
+  for f in "${FILES[@]}"; do
+    if [[ -f "$f" ]]; then
+      file_block+="- $(realpath "$f")"$'\n'
+    elif [[ -d "$f" ]]; then
+      file_block+="- $(realpath "$f")/  (directory)"$'\n'
+    else
+      echo "ask: warn: path not found: $f" >&2
+      file_block+="- ${f}  (missing)"$'\n'
+    fi
+  done
+  prompt="You are a document Q&A assistant (semtools-compatible ask via Grok CLI).
+Use only the listed files (read them with tools). Cite file paths in your answer.
+If evidence is missing, say so.
+
+Question: ${QUERY}
+${file_block}"
+  TOOLS="${ASK_TOOLS:-read_file,grep,list_dir}"
+fi
+
+# --- invoke grok headless ---
+cmd=("$GROK_BIN" -p "$prompt" --max-turns "$MAX_TURNS" --output-format plain)
+if [[ -z "${ASK_NO_YOLO:-}" ]]; then
+  cmd+=(--yolo)
+fi
+if [[ -n "$TOOLS" ]]; then
+  cmd+=(--tools "$TOOLS")
+fi
+if [[ -n "$MODEL" ]]; then
+  cmd+=(-m "$MODEL")
+fi
+
+if [[ "$JSON" -eq 1 ]]; then
+  # Capture plain answer, wrap as JSON (semtools has richer schema; keep minimal)
+  answer="$("${cmd[@]}")"
+  # Escape for JSON
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg response "$answer" --arg query "$QUERY" \
+      '{response: $response, query: $query, backend: "grok-cli"}'
+  else
+    python3 -c 'import json,sys; print(json.dumps({"response":sys.stdin.read(),"query":sys.argv[1],"backend":"grok-cli"}))' "$QUERY" <<<"$answer"
+  fi
+else
+  exec "${cmd[@]}"
+fi
